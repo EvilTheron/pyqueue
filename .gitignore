@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+dist/
+
+# Tools
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+
+# Broker data (segment files)
+data/
+
+# Private notes
+JOURNAL.md
