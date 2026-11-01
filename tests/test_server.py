@@ -1,21 +1,10 @@
 import asyncio
-from collections.abc import AsyncIterator
-
-import pytest
 
 from pyqueue.protocol import LENGTH, MAX_FRAME_SIZE, Frame, RequestType, encode_frame
 from pyqueue.server import Server
 from pyqueue.transport import read_frame, write_frame
 
 TIMEOUT = 2.0
-
-
-@pytest.fixture
-async def server() -> AsyncIterator[Server]:
-    srv = Server(port=0)
-    await srv.start()
-    yield srv
-    await srv.stop()
 
 
 async def connect(server: Server) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
