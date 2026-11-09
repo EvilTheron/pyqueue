@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from pyqueue.index import Index, index_path
 from pyqueue.record import Record, encode_record
 from pyqueue.segment import Segment, segment_path
 
@@ -156,3 +157,68 @@ def test_failed_recovery_closes_file(tmp_path: Path, monkeypatch: pytest.MonkeyP
         Segment(tmp_path, 0)
     # On Windows an open handle would block deletion.
     segment_path(tmp_path, 0).unlink()
+    index_path(tmp_path, 0).unlink()
+
+
+def test_failed_index_open_closes_log_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_load(self: Index) -> None:
+        raise OSError("disk error")
+
+    monkeypatch.setattr(Index, "_load", broken_load)
+    with pytest.raises(OSError):
+        Segment(tmp_path, 0)
+    segment_path(tmp_path, 0).unlink()
+
+
+def test_invalid_index_interval_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        Segment(tmp_path, 0, index_interval_bytes=0)
+
+
+def test_index_gets_an_entry_every_interval(tmp_path: Path) -> None:
+    with Segment(tmp_path, 0, index_interval_bytes=100) as segment:
+        for i in range(20):
+            segment.append(b"x" * 30, timestamp_ms=i)  # 58 bytes per record
+        positions = {p: r.offset for p, r in segment.records()}
+        entries = segment.index.entries()
+        # 58 bytes per record, entry after >= 100 bytes: every second record is indexed.
+        assert [offset for offset, _ in entries] == list(range(2, 20, 2))
+        assert all(positions[position] == offset for offset, position in entries)
+
+
+def test_find_every_offset(tmp_path: Path) -> None:
+    with Segment(tmp_path, 50, index_interval_bytes=100) as segment:
+        for i in range(30):
+            segment.append(f"value {i}".encode(), timestamp_ms=i)
+        for position, record in segment.records():
+            assert segment.find(record.offset) == position
+
+
+@pytest.mark.parametrize("offset", [49, 53])
+def test_find_outside_segment_raises(tmp_path: Path, offset: int) -> None:
+    with fill(tmp_path, 3, base_offset=50) as segment, pytest.raises(ValueError):
+        segment.find(offset)
+
+
+def test_reopen_rebuilds_the_same_index(tmp_path: Path) -> None:
+    with Segment(tmp_path, 0, index_interval_bytes=100) as segment:
+        for i in range(20):
+            segment.append(f"value {i}".encode(), timestamp_ms=i)
+        before = segment.index.entries()
+    index_path(tmp_path, 0).write_bytes(b"garbage")  # a damaged index file is not trusted
+    with Segment(tmp_path, 0, index_interval_bytes=100) as segment:
+        assert segment.index.entries() == before
+        assert len(before) > 0
+
+
+def test_index_does_not_point_into_truncated_tail(tmp_path: Path) -> None:
+    with Segment(tmp_path, 0, index_interval_bytes=50) as segment:
+        for i in range(10):
+            segment.append(b"x" * 30, timestamp_ms=i)
+        cut = segment.find(6)
+    path = segment_path(tmp_path, 0)
+    path.write_bytes(path.read_bytes()[: cut + 5])  # crash in the middle of record 6
+    with Segment(tmp_path, 0, index_interval_bytes=50) as segment:
+        assert segment.next_offset == 6
+        assert all(position < segment.size for _, position in segment.index.entries())
+        assert segment.find(5) < segment.size
