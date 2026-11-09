@@ -5,7 +5,7 @@ import pytest
 
 from pyqueue.index import Index, index_path
 from pyqueue.record import Record, encode_record
-from pyqueue.segment import Segment, segment_path
+from pyqueue.segment import Segment, SegmentCorruptError, segment_path
 
 
 def fill(directory: Path, count: int, base_offset: int = 0) -> Segment:
@@ -149,7 +149,7 @@ def test_close_is_idempotent(tmp_path: Path) -> None:
 def test_failed_recovery_closes_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fill(tmp_path, 1).close()
 
-    def broken_recover(self: Segment) -> None:
+    def broken_recover(self: Segment, repair: bool) -> None:
         raise OSError("disk error")
 
     monkeypatch.setattr(Segment, "_recover", broken_recover)
@@ -222,3 +222,53 @@ def test_index_does_not_point_into_truncated_tail(tmp_path: Path) -> None:
         assert segment.next_offset == 6
         assert all(position < segment.size for _, position in segment.index.entries())
         assert segment.find(5) < segment.size
+
+
+def test_without_repair_damage_raises_and_file_is_untouched(tmp_path: Path) -> None:
+    fill(tmp_path, 3).close()
+    path = segment_path(tmp_path, 0)
+    damaged = path.read_bytes() + b"\x00\x00"
+    path.write_bytes(damaged)
+    with pytest.raises(SegmentCorruptError):
+        Segment(tmp_path, 0, repair=False)
+    assert path.read_bytes() == damaged
+    path.unlink()  # the failed open closed its files (Windows would refuse otherwise)
+
+
+def test_without_repair_unexpected_offset_raises(tmp_path: Path) -> None:
+    fill(tmp_path, 1).close()
+    path = segment_path(tmp_path, 0)
+    path.write_bytes(path.read_bytes() + encode_record(Record(5, 0, None, b"stray")))
+    with pytest.raises(SegmentCorruptError):
+        Segment(tmp_path, 0, repair=False)
+
+
+def test_without_repair_valid_segment_opens(tmp_path: Path) -> None:
+    fill(tmp_path, 3).close()
+    with Segment(tmp_path, 0, repair=False) as segment:
+        assert segment.next_offset == 3
+
+
+def test_closed_property(tmp_path: Path) -> None:
+    segment = Segment(tmp_path, 0)
+    assert not segment.closed
+    segment.close()
+    assert segment.closed
+
+
+def test_close_releases_files_even_if_sync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    segment = fill(tmp_path, 1)
+
+    def failing_fsync(fd: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+    with pytest.raises(OSError):
+        segment.close()
+    assert segment.closed
+    assert segment.index.closed
+    monkeypatch.undo()
+    segment_path(tmp_path, 0).unlink()
+    index_path(tmp_path, 0).unlink()

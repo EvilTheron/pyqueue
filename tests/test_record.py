@@ -11,6 +11,7 @@ from pyqueue.record import (
     RecordError,
     decode_record,
     encode_record,
+    encoded_size,
 )
 
 RECORD = Record(offset=7, timestamp_ms=1_700_000_000_000, key=b"user-1", value=b"hello")
@@ -35,6 +36,7 @@ def test_encode_layout() -> None:
 def test_roundtrip(record: Record) -> None:
     data = encode_record(record)
     assert decode_record(data) == (record, len(data))
+    assert encoded_size(record) == len(data)
 
 
 def test_decodes_records_one_after_another() -> None:

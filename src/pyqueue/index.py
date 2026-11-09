@@ -46,6 +46,10 @@ class Index:
             self._file.close()
             raise
 
+    @property
+    def closed(self) -> bool:
+        return self._file.closed
+
     def __len__(self) -> int:
         return len(self._offsets)
 
@@ -78,9 +82,11 @@ class Index:
 
     def close(self) -> None:
         if not self._file.closed:
-            self._file.flush()
-            os.fsync(self._file.fileno())
-            self._file.close()
+            try:
+                self._file.flush()
+                os.fsync(self._file.fileno())
+            finally:
+                self._file.close()
 
     def __enter__(self) -> Self:
         return self

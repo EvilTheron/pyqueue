@@ -4,8 +4,11 @@ A segment is named after the offset of its first record, zero-padded to 20 digit
 (`00000000000000000000.log`), so a directory listing sorts segments in offset order.
 
 When a segment is opened, every record is checked. The first record that is incomplete,
-fails its checksum or has an unexpected offset marks the end of valid data, and the file
-is truncated there. This removes a half-written tail left by a crash.
+fails its checksum or has an unexpected offset marks the end of valid data. With
+`repair=True` the file is truncated there, which removes a half-written tail left by
+a crash. With `repair=False` the segment refuses to open instead: this is used for
+segments that were fully synced before the crash, where damage means a disk problem
+rather than an interrupted write, and silently dropping data would hide it.
 
 Every `index_interval_bytes` of log data, the position of the next record is added to
 the sparse index (see `index.py`), so a record can be found by offset without reading
@@ -13,7 +16,7 @@ the segment from the start. The index is rebuilt from the records whenever the s
 is opened, so a stale or damaged index file is never trusted.
 
 The segment does not decide when data reaches the disk: `sync()` is called by the owner
-according to its fsync policy.
+according to its fsync policy. A segment is not thread-safe.
 """
 
 import logging
@@ -43,6 +46,10 @@ SUFFIX = ".log"
 DEFAULT_INDEX_INTERVAL_BYTES = 4096
 
 
+class SegmentCorruptError(Exception):
+    """A segment opened with `repair=False` contains invalid data."""
+
+
 def segment_path(directory: Path, base_offset: int) -> Path:
     return directory / f"{base_offset:020d}{SUFFIX}"
 
@@ -53,6 +60,8 @@ class Segment:
         directory: Path,
         base_offset: int,
         index_interval_bytes: int = DEFAULT_INDEX_INTERVAL_BYTES,
+        *,
+        repair: bool = True,
     ) -> None:
         if base_offset < 0:
             raise ValueError(f"base offset must not be negative, got {base_offset}")
@@ -70,7 +79,7 @@ class Segment:
         try:
             self.index = Index(directory, base_offset)
             try:
-                self._recover()
+                self._recover(repair)
             except BaseException:
                 self.index.close()
                 raise
@@ -78,12 +87,18 @@ class Segment:
             self._file.close()
             raise
 
+    @property
+    def closed(self) -> bool:
+        return self._file.closed
+
     def append(
         self, value: bytes, key: bytes | None = None, timestamp_ms: int | None = None
     ) -> int:
         """Write a record at the end of the segment and return its offset.
 
-        The data is handed to the operating system but not forced to disk; call `sync()` for that.
+        The record is encoded and validated before anything is written, so a `RecordError`
+        leaves the segment unchanged. The data is handed to the operating system but not
+        forced to disk; call `sync()` for that.
         """
         if timestamp_ms is None:
             timestamp_ms = time.time_ns() // 1_000_000
@@ -128,9 +143,11 @@ class Segment:
 
     def close(self) -> None:
         if not self._file.closed:
-            self.sync()
-            self._file.close()
-            self.index.close()
+            try:
+                self.sync()
+            finally:
+                self._file.close()
+                self.index.close()
 
     def __enter__(self) -> Self:
         return self
@@ -161,7 +178,7 @@ class Segment:
             self._bytes_since_index = 0
         self._bytes_since_index += size
 
-    def _recover(self) -> None:
+    def _recover(self, repair: bool) -> None:
         # The same rule as in append() runs again over every record, so the rebuilt
         # index is identical to the one written before the restart.
         self.index.clear()
@@ -171,18 +188,22 @@ class Segment:
             try:
                 record, size = self._read_raw(position)
             except RecordError as exc:
-                self._truncate(position, file_size, str(exc))
+                self._handle_invalid(position, file_size, str(exc), repair)
                 return
             if record.offset != self.next_offset:
                 reason = f"expected offset {self.next_offset}, found {record.offset}"
-                self._truncate(position, file_size, reason)
+                self._handle_invalid(position, file_size, reason, repair)
                 return
             self._track(record.offset, position, size)
             position += size
             self.next_offset += 1
         self.size = position
 
-    def _truncate(self, position: int, file_size: int, reason: str) -> None:
+    def _handle_invalid(self, position: int, file_size: int, reason: str, repair: bool) -> None:
+        if not repair:
+            raise SegmentCorruptError(
+                f"{self.path.name}: invalid data at position {position}: {reason}"
+            )
         self._file.truncate(position)
         self.sync()
         self.size = position

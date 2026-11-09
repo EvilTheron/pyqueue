@@ -89,3 +89,19 @@ def test_failed_load_closes_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     with pytest.raises(OSError):
         Index(tmp_path, 0)
     index_path(tmp_path, 0).unlink()  # an open handle would block this on Windows
+
+
+def test_close_releases_file_even_if_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index = Index(tmp_path, 0)
+
+    def failing_fsync(fd: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("os.fsync", failing_fsync)
+    with pytest.raises(OSError):
+        index.close()
+    assert index.closed
+    monkeypatch.undo()
+    index_path(tmp_path, 0).unlink()  # an open handle would block this on Windows

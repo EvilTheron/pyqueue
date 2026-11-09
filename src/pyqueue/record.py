@@ -58,6 +58,11 @@ def encode_record(record: Record) -> bytes:
     return LENGTH.pack(length) + CRC.pack(zlib.crc32(body)) + body
 
 
+def encoded_size(record: Record) -> int:
+    """Return the number of bytes `encode_record` produces for this record."""
+    return LENGTH.size + MIN_LENGTH + len(record.key or b"") + len(record.value)
+
+
 def decode_record(data: bytes, position: int = 0) -> tuple[Record, int]:
     """Decode the record that starts at `position`.
 
