@@ -24,6 +24,7 @@ class RequestType(IntEnum):
     COMMIT_OFFSET = 2
     FETCH_OFFSET = 3
     METADATA = 4
+    CREATE_TOPIC = 5
 
 
 class ProtocolError(Exception):
