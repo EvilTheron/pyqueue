@@ -36,3 +36,6 @@ dev = [
     "pytest-cov>=7.1.0",
     "ruff>=0.17.3",
 ]
+
+[tool.coverage.run]
+omit = ["*/pyqueue/__main__.py"]
