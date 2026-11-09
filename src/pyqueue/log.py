@@ -24,6 +24,11 @@ reopened. After a failed fsync the operating system may already have dropped the
 pages, so retrying the fsync could falsely report success. Reopening re-reads the files
 and repairs the tail. Reads stay available.
 
+Only one `Log` may use a directory at a time: an exclusive lock on the directory is
+taken before any segment is read and released after all segments are closed. A second
+`Log` on the same directory, in this or another process, fails with
+`DirectoryLockedError`. The operating system drops the lock if the process dies.
+
 A log is not thread-safe; it is meant to be used from a single event loop. File
 operations are blocking.
 """
@@ -39,6 +44,7 @@ from types import TracebackType
 from typing import Self
 
 from pyqueue.index import MAX_UINT32
+from pyqueue.lock import DirectoryLock
 from pyqueue.record import MAX_RECORD_SIZE, Record, encoded_size
 from pyqueue.segment import (
     DEFAULT_INDEX_INTERVAL_BYTES,
@@ -113,12 +119,16 @@ class Log:
         self._failure: OSError | None = None
         self._closed = False
         directory.mkdir(parents=True, exist_ok=True)
+        self._lock = DirectoryLock(directory)
+        self._lock.acquire()
         try:
             self._load()
         except BaseException:
-            # Keep the original error; a second one from closing would only hide it.
+            # Keep the original error; a second one from cleanup would only hide it.
             with contextlib.suppress(Exception):
                 self._close_segments()
+            with contextlib.suppress(Exception):
+                self._lock.release()
             raise
 
     @property
@@ -214,7 +224,11 @@ class Log:
         if self._closed:
             return
         self._closed = True
-        self._close_segments()
+        try:
+            self._close_segments()
+        finally:
+            # Released last: no other process may open the files while they are still open here.
+            self._lock.release()
 
     def __enter__(self) -> Self:
         return self
