@@ -52,6 +52,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -59,7 +60,7 @@ from typing import Self
 
 from pyqueue.index import MAX_UINT32
 from pyqueue.lock import DirectoryLock
-from pyqueue.record import MAX_RECORD_SIZE, Record, encoded_size
+from pyqueue.record import MAX_RECORD_SIZE, Record, check_size, encoded_size
 from pyqueue.segment import (
     DEFAULT_INDEX_INTERVAL_BYTES,
     Segment,
@@ -184,18 +185,40 @@ class Log:
         is raised, the record may or may not be in the log after a restart, so the caller
         must treat it as not acknowledged.
         """
+        return self.append_batch([(value, key)], timestamp_ms)
+
+    def append_batch(
+        self, records: Sequence[tuple[bytes, bytes | None]], timestamp_ms: int | None = None
+    ) -> int:
+        """Append `(value, key)` pairs with one timestamp and return the first offset.
+
+        Every record is checked before any is written, so a `RecordError` leaves the log
+        unchanged. With the default policy the batch is synced once, after the last record:
+        one fsync per batch instead of one per record. If an `OSError` is raised, any
+        prefix of the batch may be in the log after a restart, so the caller must treat
+        the whole batch as not acknowledged.
+        """
+        if not records:
+            raise ValueError("batch must not be empty")
         self._check_writable()
+        for value, key in records:
+            check_size(key, value)
+        if timestamp_ms is None:
+            timestamp_ms = time.time_ns() // 1_000_000
+
+        base_offset = self.next_offset
+        self._dirty = True
         try:
-            if self._segments[-1].size >= self.config.segment_bytes:
-                self._roll()
-            offset = self._segments[-1].append(value, key, timestamp_ms)
+            for value, key in records:
+                if self._segments[-1].size >= self.config.segment_bytes:
+                    self._roll()
+                self._segments[-1].append(value, key, timestamp_ms)
         except OSError as exc:
             self._failure = exc
             raise
-        self._dirty = True
         if self.config.fsync_interval_ms == 0:
             self.sync()
-        return offset
+        return base_offset
 
     def read(self, offset: int, max_bytes: int = MAX_RECORD_SIZE) -> list[Record]:
         """Read records starting at `offset`, up to about `max_bytes` of encoded data.

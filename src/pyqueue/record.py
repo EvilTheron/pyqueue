@@ -58,6 +58,13 @@ def encode_record(record: Record) -> bytes:
     return LENGTH.pack(length) + CRC.pack(zlib.crc32(body)) + body
 
 
+def check_size(key: bytes | None, value: bytes) -> None:
+    """Raise `RecordError` if a record with this key and value would be too large to encode."""
+    length = MIN_LENGTH + len(key or b"") + len(value)
+    if length > MAX_RECORD_SIZE:
+        raise RecordError(f"record of {length} bytes exceeds {MAX_RECORD_SIZE}")
+
+
 def encoded_size(record: Record) -> int:
     """Return the number of bytes `encode_record` produces for this record."""
     return LENGTH.size + MIN_LENGTH + len(record.key or b"") + len(record.value)

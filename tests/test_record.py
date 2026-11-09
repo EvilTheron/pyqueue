@@ -9,6 +9,7 @@ from pyqueue.record import (
     IncompleteRecordError,
     Record,
     RecordError,
+    check_size,
     decode_record,
     encode_record,
     encoded_size,
@@ -90,3 +91,14 @@ def test_encode_rejects_out_of_range_offset(offset: int) -> None:
 def test_encode_rejects_oversized_record() -> None:
     with pytest.raises(RecordError):
         encode_record(Record(0, 0, None, bytes(MAX_RECORD_SIZE)))
+
+
+def test_check_size_matches_encode() -> None:
+    key = b"k"
+    largest = bytes(MAX_RECORD_SIZE - encoded_size(Record(0, 0, key, b"")) + 4)
+    check_size(key, largest)
+    encode_record(Record(0, 0, key, largest))
+    with pytest.raises(RecordError):
+        check_size(key, largest + b"x")
+    with pytest.raises(RecordError):
+        encode_record(Record(0, 0, key, largest + b"x"))

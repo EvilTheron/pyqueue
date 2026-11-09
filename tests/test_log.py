@@ -575,3 +575,74 @@ def test_retention_on_closed_log_raises(tmp_path: Path) -> None:
     log.close()
     with pytest.raises(LogError):
         log.apply_retention()
+
+
+def test_append_batch(tmp_path: Path) -> None:
+    with Log(tmp_path) as log:
+        log.append(b"first")
+        assert log.append_batch([(b"a", None), (b"b", b"key")], timestamp_ms=5) == 1
+        assert log.read(1) == [Record(1, 5, None, b"a"), Record(2, 5, b"key", b"b")]
+        assert log.next_offset == 3
+
+
+def test_append_batch_syncs_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    real_sync = Segment.sync
+
+    def counting_sync(self: Segment) -> None:
+        nonlocal calls
+        calls += 1
+        real_sync(self)
+
+    with Log(tmp_path) as log:
+        monkeypatch.setattr(Segment, "sync", counting_sync)
+        log.append_batch([(VALUE, None)] * 10)
+        assert calls == 1
+
+
+def test_append_batch_rolls_segments(tmp_path: Path) -> None:
+    with Log(tmp_path, LogConfig(segment_bytes=200)) as log:
+        assert log.append_batch([(VALUE, None)] * 10) == 0
+        assert log.segment_count > 1
+        assert [record.offset for record in log.read(0, 10_000)] == list(range(10))
+
+
+def test_append_batch_checks_every_record_first(tmp_path: Path) -> None:
+    with Log(tmp_path) as log:
+        with pytest.raises(RecordError):
+            log.append_batch([(b"ok", None), (bytes(MAX_RECORD_SIZE), None)])
+        assert log.next_offset == 0
+        assert log.size_bytes == 0
+        assert log.append(b"still writable") == 0
+
+
+def test_empty_batch_is_rejected(tmp_path: Path) -> None:
+    with Log(tmp_path) as log, pytest.raises(ValueError, match="empty"):
+        log.append_batch([])
+
+
+def test_failed_write_in_batch_stops_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_append = Segment.append
+    calls = 0
+
+    def append_then_fail(
+        self: Segment, value: bytes, key: bytes | None = None, timestamp_ms: int | None = None
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("no space left on device")
+        return real_append(self, value, key, timestamp_ms)
+
+    with Log(tmp_path) as log:
+        monkeypatch.setattr(Segment, "append", append_then_fail)
+        with pytest.raises(OSError):
+            log.append_batch([(b"a", None), (b"b", None), (b"c", None)])
+        monkeypatch.undo()
+        with pytest.raises(LogFailedError):
+            log.append(b"d")
+    with Log(tmp_path) as reopened:
+        # The unacknowledged batch left a prefix behind; the log is still consistent.
+        assert [record.value for record in reopened.read(0)] == [b"a"]
