@@ -5,7 +5,9 @@ import pytest
 
 from pyqueue.broker import (
     CREATING_SUFFIX,
+    MAX_GROUP_LENGTH,
     MAX_PARTITIONS,
+    OFFSETS_DIR,
     Broker,
     BrokerCorruptError,
     BrokerError,
@@ -92,7 +94,7 @@ def test_invalid_topic_names(tmp_path: Path, name: str) -> None:
         with pytest.raises(InvalidRequestError):
             broker.create_topic(name, 1)
         assert broker.topics() == {}
-    assert [p.name for p in tmp_path.iterdir()] == [".lock"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".lock", OFFSETS_DIR]
 
 
 @pytest.mark.parametrize("partitions", [0, -1, MAX_PARTITIONS + 1])
@@ -305,6 +307,60 @@ def test_close_closes_every_log_and_raises_the_first_error(
     monkeypatch.setattr(Log, "close", failing_close)
     with pytest.raises(OSError, match="disk went away"):
         broker.close()
-    assert len(closed) == 2
+    # The offset store's log and both partitions.
+    assert sorted(path.name for path in closed) == ["0", "1", OFFSETS_DIR]
     monkeypatch.undo()
     Broker(tmp_path).close()  # the directory lock was released anyway
+
+
+def test_commit_and_fetch_offsets(tmp_path: Path) -> None:
+    with Broker(tmp_path) as broker:
+        broker.create_topic("orders", 2)
+        broker.produce("orders", 0, records(b"a", b"b"))
+        assert broker.fetch_offset("billing", "orders", 0) is None
+        broker.commit_offset("billing", "orders", 0, 1)
+        broker.commit_offset("billing", "orders", 0, 2)  # read everything
+        broker.commit_offset("audit", "orders", 0, 0)
+        broker.commit_offset("billing", "orders", 1, 0)
+    with Broker(tmp_path) as broker:
+        assert broker.fetch_offset("billing", "orders", 0) == 2
+        assert broker.fetch_offset("audit", "orders", 0) == 0
+        assert broker.fetch_offset("billing", "orders", 1) == 0
+        assert broker.topics() == {"orders": 2}  # ~offsets is not a topic
+
+
+@pytest.mark.parametrize("offset", [-1, 3])
+def test_commit_outside_the_log_is_rejected(tmp_path: Path, offset: int) -> None:
+    with Broker(tmp_path) as broker:
+        broker.create_topic("orders", 1)
+        broker.produce("orders", 0, records(b"a", b"b"))
+        with pytest.raises(OffsetOutOfRangeError):
+            broker.commit_offset("billing", "orders", 0, offset)
+        assert broker.fetch_offset("billing", "orders", 0) is None
+
+
+@pytest.mark.parametrize("group", ["", "g" * (MAX_GROUP_LENGTH + 1)])
+def test_invalid_group_is_rejected(tmp_path: Path, group: str) -> None:
+    with Broker(tmp_path) as broker:
+        broker.create_topic("orders", 1)
+        with pytest.raises(InvalidRequestError):
+            broker.commit_offset(group, "orders", 0, 0)
+        with pytest.raises(InvalidRequestError):
+            broker.fetch_offset(group, "orders", 0)
+
+
+def test_offsets_of_unknown_topic_are_rejected(tmp_path: Path) -> None:
+    with Broker(tmp_path) as broker:
+        broker.create_topic("orders", 1)
+        with pytest.raises(UnknownTopicOrPartitionError):
+            broker.commit_offset("billing", "missing", 0, 0)
+        with pytest.raises(UnknownTopicOrPartitionError):
+            broker.fetch_offset("billing", "orders", 1)
+
+
+def test_closed_broker_rejects_offset_requests(tmp_path: Path) -> None:
+    broker = Broker(tmp_path)
+    broker.create_topic("orders", 1)
+    broker.close()
+    with pytest.raises(BrokerError, match="closed"):
+        broker.fetch_offset("billing", "orders", 0)

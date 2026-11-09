@@ -12,12 +12,8 @@ from pyqueue.handler import _ERROR_BODIES, RequestHandler, error_code_for
 from pyqueue.log import LogError, LogFailedError, OffsetOutOfRangeError
 from pyqueue.messages import (
     MAX_RECORD_DATA_SIZE,
-    CommitOffsetRequest,
-    CommitOffsetResponse,
     CreateTopicResponse,
     ErrorCode,
-    FetchOffsetRequest,
-    FetchOffsetResponse,
     ProduceRecord,
 )
 from pyqueue.protocol import Frame, RequestType
@@ -108,14 +104,22 @@ async def test_malformed_body_keeps_connection_open(server: Server) -> None:
         assert await client.metadata() == {}
 
 
-async def test_offset_requests_are_not_supported_yet(server: Server) -> None:
+async def test_commit_and_fetch_offset(server: Server) -> None:
     async with Client(port=server.port) as client:
-        body = CommitOffsetRequest("g", "orders", 0, 1).encode()
-        response = await client.request(RequestType.COMMIT_OFFSET, body)
-        assert CommitOffsetResponse.decode(response.body).error is ErrorCode.UNSUPPORTED_REQUEST
-        body = FetchOffsetRequest("g", "orders", 0).encode()
-        response = await client.request(RequestType.FETCH_OFFSET, body)
-        assert FetchOffsetResponse.decode(response.body).error is ErrorCode.UNSUPPORTED_REQUEST
+        await client.create_topic("orders", 1)
+        await client.produce("orders", 0, [ProduceRecord(b"a"), ProduceRecord(b"b")])
+        assert await client.fetch_offset("billing", "orders", 0) is None
+        await client.commit_offset("billing", "orders", 0, 2)
+        assert await client.fetch_offset("billing", "orders", 0) == 2
+
+        await expect_error(
+            client.commit_offset("billing", "orders", 0, 3), ErrorCode.OFFSET_OUT_OF_RANGE
+        )
+        await expect_error(client.commit_offset("", "orders", 0, 0), ErrorCode.INVALID_REQUEST)
+        await expect_error(
+            client.fetch_offset("billing", "missing", 0), ErrorCode.UNKNOWN_TOPIC_OR_PARTITION
+        )
+        assert await client.fetch_offset("billing", "orders", 0) == 2
 
 
 @pytest.mark.parametrize(

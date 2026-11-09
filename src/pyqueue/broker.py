@@ -4,6 +4,7 @@ Layout:
 
     data_dir/
     ├── .lock          only one broker may use the directory
+    ├── ~offsets/      committed offsets of consumer groups (see `pyqueue.offsets`)
     └── orders/        topic
         ├── 0/         partition: a `Log` directory with segments and its own lock
         └── 1/
@@ -12,7 +13,8 @@ A topic is created atomically: its partition directories are made inside a tempo
 directory `<name>~creating`, which is then renamed to `<name>` in one step. After a crash
 a topic therefore exists with all its partitions or not at all. Leftovers of an
 interrupted creation are deleted at startup; `~` is not allowed in topic names, so a
-leftover can never be mistaken for a topic. Any other unexpected directory, or a topic
+leftover can never be mistaken for a topic. Directories starting with `~` belong to
+the offset store and are skipped. Any other unexpected directory, or a topic
 whose partitions are not exactly `0..N-1`, stops the broker from starting: as with a
 damaged log, guessing could lose data.
 
@@ -44,8 +46,9 @@ from types import TracebackType
 from typing import Self
 
 from pyqueue.lock import DirectoryLock
-from pyqueue.log import Log, LogConfig, fsync_directory
+from pyqueue.log import Log, LogConfig, OffsetOutOfRangeError, fsync_directory
 from pyqueue.messages import MAX_FETCH_RECORDS_SIZE, MAX_RECORD_DATA_SIZE, ProduceRecord
+from pyqueue.offsets import DEFAULT_COMPACT_BYTES, OffsetStore
 from pyqueue.record import Record
 
 logger = logging.getLogger(__name__)
@@ -56,6 +59,9 @@ WINDOWS_RESERVED_NAMES = frozenset(
     {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(10)} | {f"lpt{i}" for i in range(10)}
 )
 CREATING_SUFFIX = "~creating"
+INTERNAL_PREFIX = "~"
+OFFSETS_DIR = "~offsets"
+MAX_GROUP_LENGTH = 249
 # Every partition keeps files open (lock, segment, index), so the count is capped.
 MAX_PARTITIONS = 1000
 
@@ -97,6 +103,12 @@ def validate_topic_name(name: str) -> None:
         raise InvalidRequestError(f"invalid topic name {name!r}: reserved on Windows")
 
 
+def validate_group(group: str) -> None:
+    """Raise `InvalidRequestError` if `group` cannot be used as a consumer group name."""
+    if not 0 < len(group) <= MAX_GROUP_LENGTH:
+        raise InvalidRequestError(f"group name must have 1-{MAX_GROUP_LENGTH} characters")
+
+
 class _Partition:
     def __init__(self, log: Log) -> None:
         self.log = log
@@ -104,10 +116,16 @@ class _Partition:
 
 
 class Broker:
-    def __init__(self, data_dir: Path, log_config: LogConfig | None = None) -> None:
+    def __init__(
+        self,
+        data_dir: Path,
+        log_config: LogConfig | None = None,
+        offsets_compact_bytes: int = DEFAULT_COMPACT_BYTES,
+    ) -> None:
         self.data_dir = data_dir
         self.log_config = log_config or LogConfig()
         self._topics: dict[str, list[_Partition]] = {}
+        self._offsets: OffsetStore | None = None
         self._topics_lock = threading.Lock()
         self._closed = False
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -115,6 +133,7 @@ class Broker:
         self._lock.acquire()
         try:
             self._load()
+            self._offsets = OffsetStore(data_dir / OFFSETS_DIR, offsets_compact_bytes)
         except BaseException:
             # Keep the original error; a second one from cleanup would only hide it.
             with contextlib.suppress(Exception):
@@ -189,6 +208,26 @@ class Broker:
             records = target.log.read(offset, min(max_bytes, MAX_FETCH_RECORDS_SIZE))
             return records, target.log.next_offset
 
+    def commit_offset(self, group: str, topic: str, partition: int, offset: int) -> None:
+        """Store the offset a consumer group will read next; on disk when this returns.
+
+        The offset may be anything from 0 to the partition's next offset (a consumer
+        that has read everything commits the next offset).
+        """
+        validate_group(group)
+        target = self._partition(topic, partition)
+        with target.lock:
+            end = target.log.next_offset
+        if not 0 <= offset <= end:
+            raise OffsetOutOfRangeError(f"offset {offset} is outside [0, {end}]")
+        self._offset_store().commit(group, topic, partition, offset)
+
+    def fetch_offset(self, group: str, topic: str, partition: int) -> int | None:
+        """Return the committed offset, or None if the group has not committed one."""
+        validate_group(group)
+        self._partition(topic, partition)
+        return self._offset_store().get(group, topic, partition)
+
     def close(self) -> None:
         with self._topics_lock:
             if self._closed:
@@ -212,7 +251,7 @@ class Broker:
 
     def _load(self) -> None:
         for entry in sorted(self.data_dir.iterdir()):
-            if not entry.is_dir():
+            if not entry.is_dir() or entry.name.startswith(INTERNAL_PREFIX):
                 continue
             if entry.name.endswith(CREATING_SUFFIX):
                 logger.warning("removing unfinished topic creation %s", entry.name)
@@ -251,9 +290,21 @@ class Broker:
             raise UnknownTopicOrPartitionError(f"unknown topic or partition {topic}/{partition}")
         return partitions[partition]
 
+    def _offset_store(self) -> OffsetStore:
+        with self._topics_lock:
+            self._check_open()
+        assert self._offsets is not None  # set in __init__ before the broker is usable
+        return self._offsets
+
     def _close_logs(self) -> None:
-        """Close every log, even if some fail; then raise the first error."""
+        """Close every log and the offset store, even if some fail; raise the first error."""
         first_error: Exception | None = None
+        if self._offsets is not None:
+            try:
+                self._offsets.close()
+            except Exception as exc:
+                logger.exception("failed to close the offset store")
+                first_error = exc
         for partitions in self._topics.values():
             for partition in partitions:
                 with partition.lock:

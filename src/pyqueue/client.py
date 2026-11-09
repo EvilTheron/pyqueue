@@ -1,8 +1,8 @@
 """Asyncio client for the PyQueue frame protocol.
 
 `request()` sends raw frames. The typed methods (`create_topic`, `produce`, `fetch`,
-`metadata`) encode the request body, decode the response and raise `RequestFailedError`
-if the broker answered with an error code.
+`commit_offset`, `fetch_offset`, `metadata`) encode the request body, decode the response
+and raise `RequestFailedError` if the broker answered with an error code.
 """
 
 import asyncio
@@ -14,9 +14,13 @@ from typing import Self
 
 from pyqueue.messages import (
     MAX_FETCH_RECORDS_SIZE,
+    CommitOffsetRequest,
+    CommitOffsetResponse,
     CreateTopicRequest,
     CreateTopicResponse,
     ErrorCode,
+    FetchOffsetRequest,
+    FetchOffsetResponse,
     FetchRequest,
     FetchResponse,
     MetadataRequest,
@@ -131,6 +135,20 @@ class Client:
         response = FetchResponse.decode((await self.request(RequestType.FETCH, body)).body)
         _check(RequestType.FETCH, response.error)
         return list(response.records), response.high_watermark
+
+    async def commit_offset(self, group: str, topic: str, partition: int, offset: int) -> None:
+        """Store the offset `group` will read next from a partition."""
+        body = CommitOffsetRequest(group, topic, partition, offset).encode()
+        frame = await self.request(RequestType.COMMIT_OFFSET, body)
+        _check(RequestType.COMMIT_OFFSET, CommitOffsetResponse.decode(frame.body).error)
+
+    async def fetch_offset(self, group: str, topic: str, partition: int) -> int | None:
+        """Return the committed offset of `group`, or None if it has not committed one."""
+        body = FetchOffsetRequest(group, topic, partition).encode()
+        frame = await self.request(RequestType.FETCH_OFFSET, body)
+        response = FetchOffsetResponse.decode(frame.body)
+        _check(RequestType.FETCH_OFFSET, response.error)
+        return None if response.offset == -1 else response.offset
 
     async def metadata(self) -> dict[str, int]:
         """Return every topic with its number of partitions."""

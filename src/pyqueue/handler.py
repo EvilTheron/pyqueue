@@ -28,10 +28,12 @@ from pyqueue.broker import (
 from pyqueue.log import LogError, OffsetOutOfRangeError
 from pyqueue.messages import (
     BodyError,
+    CommitOffsetRequest,
     CommitOffsetResponse,
     CreateTopicRequest,
     CreateTopicResponse,
     ErrorCode,
+    FetchOffsetRequest,
     FetchOffsetResponse,
     FetchRequest,
     FetchResponse,
@@ -105,8 +107,10 @@ class RequestHandler:
                 return await self._fetch(FetchRequest.decode(frame.body))
             case RequestType.METADATA:
                 return await self._metadata(MetadataRequest.decode(frame.body))
-            case RequestType.COMMIT_OFFSET | RequestType.FETCH_OFFSET:
-                return _ERROR_BODIES[frame.request_type](ErrorCode.UNSUPPORTED_REQUEST)
+            case RequestType.COMMIT_OFFSET:
+                return await self._commit_offset(CommitOffsetRequest.decode(frame.body))
+            case RequestType.FETCH_OFFSET:
+                return await self._fetch_offset(FetchOffsetRequest.decode(frame.body))
 
     async def _create_topic(self, request: CreateTopicRequest) -> bytes:
         await asyncio.to_thread(self._broker.create_topic, request.topic, request.partitions)
@@ -123,6 +127,22 @@ class RequestHandler:
             self._broker.fetch, request.topic, request.partition, request.offset, request.max_bytes
         )
         return FetchResponse(ErrorCode.NONE, high_watermark, tuple(records)).encode()
+
+    async def _commit_offset(self, request: CommitOffsetRequest) -> bytes:
+        await asyncio.to_thread(
+            self._broker.commit_offset,
+            request.group,
+            request.topic,
+            request.partition,
+            request.offset,
+        )
+        return CommitOffsetResponse(ErrorCode.NONE).encode()
+
+    async def _fetch_offset(self, request: FetchOffsetRequest) -> bytes:
+        offset = await asyncio.to_thread(
+            self._broker.fetch_offset, request.group, request.topic, request.partition
+        )
+        return FetchOffsetResponse(ErrorCode.NONE, -1 if offset is None else offset).encode()
 
     async def _metadata(self, request: MetadataRequest) -> bytes:
         topics = await asyncio.to_thread(self._broker.topics)
