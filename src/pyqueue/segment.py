@@ -72,6 +72,8 @@ class Segment:
         self.next_offset = base_offset
         self.size = 0
         self.truncated_bytes = 0
+        # The newest record timestamp, used by time-based retention; None while empty.
+        self.max_timestamp_ms: int | None = None
         self._index_interval_bytes = index_interval_bytes
         self._bytes_since_index = 0
         self.path.touch(exist_ok=True)
@@ -109,6 +111,7 @@ class Segment:
         self._file.write(data)
         self._file.flush()
         self._track(offset, position, len(data))
+        self._note_timestamp(timestamp_ms)
         self.size += len(data)
         self.next_offset += 1
         return offset
@@ -178,6 +181,10 @@ class Segment:
             self._bytes_since_index = 0
         self._bytes_since_index += size
 
+    def _note_timestamp(self, timestamp_ms: int) -> None:
+        if self.max_timestamp_ms is None or timestamp_ms > self.max_timestamp_ms:
+            self.max_timestamp_ms = timestamp_ms
+
     def _recover(self, repair: bool) -> None:
         # The same rule as in append() runs again over every record, so the rebuilt
         # index is identical to the one written before the restart.
@@ -195,6 +202,7 @@ class Segment:
                 self._handle_invalid(position, file_size, reason, repair)
                 return
             self._track(record.offset, position, size)
+            self._note_timestamp(record.timestamp_ms)
             position += size
             self.next_offset += 1
         self.size = position

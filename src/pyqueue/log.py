@@ -24,6 +24,18 @@ reopened. After a failed fsync the operating system may already have dropped the
 pages, so retrying the fsync could falsely report success. Reopening re-reads the files
 and repairs the tail. Reads stay available.
 
+Retention removes whole segments from the start of the log, oldest first, so the log
+never gets a gap. The active segment is never removed. A segment is removed when
+
+* `retention_bytes` is set and the log without it is still at least that large
+  (the log never shrinks below the limit), or
+* `retention_ms` is set and its newest record is older than that.
+
+`apply_retention()` does the work; the owner calls it periodically. A removed segment
+is first dropped from memory, then closed (Windows cannot delete open files), then
+deleted from disk. If deleting fails, the log stops accepting writes; after reopening,
+the segment that was not deleted is simply the first one again.
+
 Only one `Log` may use a directory at a time: an exclusive lock on the directory is
 taken before any segment is read and released after all segments are closed. A second
 `Log` on the same directory, in this or another process, fails with
@@ -36,8 +48,10 @@ operations are blocking.
 import asyncio
 import bisect
 import contextlib
+import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -51,6 +65,8 @@ from pyqueue.segment import (
     Segment,
     SegmentCorruptError,
 )
+
+logger = logging.getLogger(__name__)
 
 SEGMENT_NAME = re.compile(r"\d{20}\.log")
 DEFAULT_SEGMENT_BYTES = 64 * 1024 * 1024
@@ -82,6 +98,8 @@ class LogConfig:
     segment_bytes: int = DEFAULT_SEGMENT_BYTES
     index_interval_bytes: int = DEFAULT_INDEX_INTERVAL_BYTES
     fsync_interval_ms: int = 0
+    retention_bytes: int | None = None
+    retention_ms: int | None = None
 
     def __post_init__(self) -> None:
         if not 0 < self.segment_bytes <= MAX_SEGMENT_BYTES:
@@ -96,6 +114,10 @@ class LogConfig:
             raise ValueError(
                 f"fsync_interval_ms must not be negative, got {self.fsync_interval_ms}"
             )
+        if self.retention_bytes is not None and self.retention_bytes <= 0:
+            raise ValueError(f"retention_bytes must be positive, got {self.retention_bytes}")
+        if self.retention_ms is not None and self.retention_ms <= 0:
+            raise ValueError(f"retention_ms must be positive, got {self.retention_ms}")
 
 
 def fsync_directory(path: Path) -> None:
@@ -219,6 +241,35 @@ class Log:
             raise
         self._dirty = False
 
+    def apply_retention(self, now_ms: int | None = None) -> int:
+        """Delete expired segments from the start of the log. Return how many were deleted."""
+        self._check_writable()
+        if now_ms is None:
+            now_ms = time.time_ns() // 1_000_000
+        size = self.size_bytes
+        expired = 0
+        for segment in self._segments[:-1]:  # never the active segment
+            if not self._is_expired(segment, size, now_ms):
+                break  # only a prefix is deleted, so the log never gets a gap
+            size -= segment.size
+            expired += 1
+        if expired == 0:
+            return 0
+        try:
+            for _ in range(expired):
+                self._delete_oldest()
+            fsync_directory(self.directory)
+        except OSError as exc:
+            self._failure = exc
+            raise
+        logger.info(
+            "%s: retention deleted %d segment(s), log now starts at offset %d",
+            self.directory,
+            expired,
+            self.start_offset,
+        )
+        return expired
+
     def close(self) -> None:
         """Sync and close all segments. Safe to call more than once."""
         if self._closed:
@@ -291,6 +342,30 @@ class Log:
         active.sync()
         self._dirty = False
         self._add_segment(self._create_segment(active.next_offset))
+
+    def _is_expired(self, segment: Segment, log_size: int, now_ms: int) -> bool:
+        retention_bytes = self.config.retention_bytes
+        if retention_bytes is not None and log_size - segment.size >= retention_bytes:
+            return True
+        retention_ms = self.config.retention_ms
+        return (
+            retention_ms is not None
+            and segment.max_timestamp_ms is not None
+            and now_ms - segment.max_timestamp_ms > retention_ms
+        )
+
+    def _delete_oldest(self) -> None:
+        # Drop it from memory first: whatever fails below, memory never refers to a closed
+        # or missing segment, and the files left on disk are still a valid log prefix.
+        segment = self._segments.pop(0)
+        self._base_offsets.pop(0)
+        segment.close()
+        segment.path.unlink()
+        try:
+            segment.index.path.unlink(missing_ok=True)
+        except OSError as exc:
+            # A leftover index is harmless: index files are never trusted or loaded alone.
+            logger.warning("could not delete %s: %s", segment.index.path.name, exc)
 
     def _close_segments(self) -> None:
         error: BaseException | None = None

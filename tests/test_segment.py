@@ -272,3 +272,13 @@ def test_close_releases_files_even_if_sync_fails(
     monkeypatch.undo()
     segment_path(tmp_path, 0).unlink()
     index_path(tmp_path, 0).unlink()
+
+
+def test_max_timestamp_is_tracked_and_restored(tmp_path: Path) -> None:
+    with Segment(tmp_path, 0) as segment:
+        assert segment.max_timestamp_ms is None
+        for ts in [5, 9, 7]:
+            segment.append(b"a", timestamp_ms=ts)
+        assert segment.max_timestamp_ms == 9
+    with Segment(tmp_path, 0) as segment:
+        assert segment.max_timestamp_ms == 9

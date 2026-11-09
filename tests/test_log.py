@@ -432,3 +432,146 @@ def test_failed_open_keeps_original_error(tmp_path: Path, monkeypatch: pytest.Mo
     # The corruption error reaches the caller, not the later error from closing.
     with pytest.raises(LogCorruptError):
         Log(tmp_path, SMALL)
+
+
+# --- retention -------------------------------------------------------------------
+
+
+def retention_log(directory: Path, **kwargs: int) -> Log:
+    """10 records of 58 bytes with timestamps 0..9 in segments starting at 0, 4 and 8."""
+    log = Log(directory, LogConfig(segment_bytes=200, index_interval_bytes=100, **kwargs))
+    fill(log, 10)
+    return log
+
+
+@pytest.mark.parametrize("kwargs", [{"retention_bytes": 0}, {"retention_ms": 0}])
+def test_invalid_retention_config_is_rejected(kwargs: dict[str, int]) -> None:
+    with pytest.raises(ValueError):
+        LogConfig(**kwargs)
+
+
+def test_no_retention_configured_deletes_nothing(tmp_path: Path) -> None:
+    with retention_log(tmp_path) as log:
+        assert log.apply_retention(now_ms=10**15) == 0
+        assert log.segment_count == 3
+
+
+def test_retention_by_size_keeps_at_least_the_limit(tmp_path: Path) -> None:
+    # Segments hold 232, 232 and 116 bytes (580 in total).
+    with retention_log(tmp_path, retention_bytes=300) as log:
+        # Without the first segment 348 >= 300 bytes remain; without the second only 116.
+        assert log.apply_retention() == 1
+        assert log.start_offset == 4
+        assert log.size_bytes == 348
+        assert segment_files(tmp_path) == [
+            "00000000000000000004.log",
+            "00000000000000000008.log",
+        ]
+        assert not index_path(tmp_path, 0).exists()
+
+
+def test_retention_by_size_never_deletes_active_segment(tmp_path: Path) -> None:
+    with retention_log(tmp_path, retention_bytes=1) as log:
+        assert log.apply_retention() == 2
+        assert log.segment_count == 1
+        assert log.apply_retention() == 0
+        assert [r.offset for r in log.read(8)] == [8, 9]
+
+
+def test_retention_by_time_uses_newest_record_of_segment(tmp_path: Path) -> None:
+    # Newest timestamps: segment 0 -> 3, segment 4 -> 7.
+    with retention_log(tmp_path, retention_ms=5) as log:
+        assert log.apply_retention(now_ms=8) == 0  # 8 - 3 = 5 is not older than 5
+        assert log.apply_retention(now_ms=9) == 1  # 9 - 3 = 6 > 5
+        assert log.start_offset == 4
+        assert log.apply_retention(now_ms=1000) == 1  # the active segment stays
+        assert log.start_offset == 8
+
+
+def test_retention_by_time_deletes_only_a_prefix(tmp_path: Path) -> None:
+    log = Log(tmp_path, LogConfig(segment_bytes=200, retention_ms=100))
+    for ts in [1000, 1000, 1000, 1000, 0, 0, 0, 0, 2000]:  # middle segment is the oldest
+        log.append(VALUE, timestamp_ms=ts)
+    with log:
+        # Segment 4 has expired, but segment 0 has not, so nothing is deleted:
+        # removing segment 4 alone would leave a gap in offsets.
+        assert log.apply_retention(now_ms=1050) == 0
+        assert log.segment_count == 3
+
+
+def test_retention_with_both_limits(tmp_path: Path) -> None:
+    with retention_log(tmp_path, retention_bytes=10_000, retention_ms=5) as log:
+        assert log.apply_retention(now_ms=9) == 1  # the size is fine, but time expired
+
+
+def test_read_after_retention(tmp_path: Path) -> None:
+    with retention_log(tmp_path, retention_bytes=300) as log:
+        log.apply_retention()
+        with pytest.raises(OffsetOutOfRangeError):
+            log.read(3)
+        assert [r.offset for r in log.read(4)] == list(range(4, 10))
+
+
+def test_reopen_after_retention(tmp_path: Path) -> None:
+    with retention_log(tmp_path, retention_bytes=300) as log:
+        log.apply_retention()
+    with Log(tmp_path, SMALL) as log:
+        assert (log.start_offset, log.next_offset) == (4, 10)
+
+
+def test_retention_syncs_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with retention_log(tmp_path, retention_bytes=300) as log:
+        synced_dirs: list[Path] = []
+        monkeypatch.setattr(log_module, "fsync_directory", synced_dirs.append)
+        log.apply_retention()
+        assert synced_dirs == [tmp_path]
+
+
+def test_failed_delete_stops_writes_and_reopen_is_consistent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_unlink = Path.unlink
+
+    def failing_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.suffix == ".log":
+            raise PermissionError("file is in use")
+        real_unlink(self, missing_ok=missing_ok)
+
+    with retention_log(tmp_path, retention_bytes=300) as log:
+        monkeypatch.setattr(Path, "unlink", failing_unlink)
+        with pytest.raises(PermissionError):
+            log.apply_retention()
+        monkeypatch.undo()
+        assert log.start_offset == 4  # memory never refers to the closed segment
+        with pytest.raises(LogFailedError):
+            log.append(VALUE)
+    with Log(tmp_path, SMALL) as log:
+        # The segment that could not be deleted is the first one again; no gap.
+        assert (log.start_offset, log.next_offset) == (0, 10)
+
+
+def test_failed_index_delete_is_only_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    real_unlink = Path.unlink
+
+    def failing_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.suffix == ".index":
+            raise PermissionError("file is in use")
+        real_unlink(self, missing_ok=missing_ok)
+
+    with retention_log(tmp_path, retention_bytes=300) as log:
+        monkeypatch.setattr(Path, "unlink", failing_unlink)
+        assert log.apply_retention() == 1
+        monkeypatch.undo()
+        assert log.append(VALUE) == 10  # the log keeps working
+    assert "could not delete 00000000000000000000.index" in caplog.text
+    with Log(tmp_path, SMALL) as log:
+        assert log.start_offset == 4  # the leftover index file is ignored
+
+
+def test_retention_on_closed_log_raises(tmp_path: Path) -> None:
+    log = retention_log(tmp_path, retention_bytes=300)
+    log.close()
+    with pytest.raises(LogError):
+        log.apply_retention()
