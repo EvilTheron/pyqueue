@@ -1,17 +1,26 @@
-"""Asyncio TCP server that speaks the PyQueue frame protocol."""
+"""Asyncio TCP server that speaks the PyQueue frame protocol.
+
+The server only moves frames: it reads a request frame, passes it to a handler and writes
+back the frame the handler returns. What a request means is up to the handler
+(`pyqueue.handler.RequestHandler` in production, an echo function in transport tests).
+"""
 
 import asyncio
 import contextlib
 import logging
+from collections.abc import Awaitable, Callable
 
 from pyqueue.protocol import Frame, ProtocolError
 from pyqueue.transport import read_frame, write_frame
 
 logger = logging.getLogger(__name__)
 
+Handler = Callable[[Frame], Awaitable[Frame]]
+
 
 class Server:
-    def __init__(self, host: str = "127.0.0.1", port: int = 9092) -> None:
+    def __init__(self, handler: Handler, host: str = "127.0.0.1", port: int = 9092) -> None:
+        self._handler = handler
         self._host = host
         self._port = port
         self._server: asyncio.Server | None = None
@@ -29,13 +38,23 @@ class Server:
         logger.info("listening on %s:%d", self._host, self.port)
 
     async def serve_forever(self) -> None:
+        """Serve until cancelled, then stop and close client connections.
+
+        `asyncio.Server.serve_forever()` is not used: when cancelled, it waits until every
+        client disconnects by itself, so one idle client would keep the server from
+        stopping.
+        """
         await self.start()
-        assert self._server is not None
-        await self._server.serve_forever()
+        try:
+            await asyncio.get_running_loop().create_future()  # never completes
+        finally:
+            await self.stop()
 
     async def stop(self) -> None:
         if self._server is not None:
             self._server.close()
+            # Without this, wait_closed() waits until every client disconnects by itself.
+            self._server.close_clients()
             await self._server.wait_closed()
             self._server = None
 
@@ -46,7 +65,7 @@ class Server:
         logger.info("client connected: %s", peer)
         try:
             while (frame := await read_frame(reader)) is not None:
-                response = await self._handle_frame(frame)
+                response = await self._handler(frame)
                 await write_frame(writer, response)
         except ProtocolError as exc:
             logger.warning("protocol error from %s: %s", peer, exc)
@@ -59,7 +78,3 @@ class Server:
             with contextlib.suppress(ConnectionError):
                 await writer.wait_closed()
             logger.info("client disconnected: %s", peer)
-
-    async def _handle_frame(self, frame: Frame) -> Frame:
-        # Echo for now; real request handling arrives with the storage layer.
-        return frame

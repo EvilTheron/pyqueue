@@ -1,17 +1,51 @@
-"""Asyncio client for the PyQueue frame protocol."""
+"""Asyncio client for the PyQueue frame protocol.
+
+`request()` sends raw frames. The typed methods (`create_topic`, `produce`, `fetch`,
+`metadata`) encode the request body, decode the response and raise `RequestFailedError`
+if the broker answered with an error code.
+"""
 
 import asyncio
 import contextlib
 import logging
+from collections.abc import Sequence
 from types import TracebackType
 from typing import Self
 
+from pyqueue.messages import (
+    MAX_FETCH_RECORDS_SIZE,
+    CreateTopicRequest,
+    CreateTopicResponse,
+    ErrorCode,
+    FetchRequest,
+    FetchResponse,
+    MetadataRequest,
+    MetadataResponse,
+    ProduceRecord,
+    ProduceRequest,
+    ProduceResponse,
+)
 from pyqueue.protocol import Frame, ProtocolError, RequestType
+from pyqueue.record import Record
 from pyqueue.transport import read_frame, write_frame
 
 logger = logging.getLogger(__name__)
 
 MAX_CORRELATION_ID = 2**32
+
+
+class RequestFailedError(Exception):
+    """The broker answered with an error code."""
+
+    def __init__(self, request_type: RequestType, error: ErrorCode) -> None:
+        super().__init__(f"{request_type.name} failed: {error.name}")
+        self.request_type = request_type
+        self.error = error
+
+
+def _check(request_type: RequestType, error: ErrorCode) -> None:
+    if error is not ErrorCode.NONE:
+        raise RequestFailedError(request_type, error)
 
 
 class Client:
@@ -75,6 +109,35 @@ class Client:
             return await asyncio.wait_for(future, self._timeout)
         finally:
             self._pending.pop(correlation_id, None)
+
+    async def create_topic(self, topic: str, partitions: int) -> None:
+        frame = await self.request(
+            RequestType.CREATE_TOPIC, CreateTopicRequest(topic, partitions).encode()
+        )
+        _check(RequestType.CREATE_TOPIC, CreateTopicResponse.decode(frame.body).error)
+
+    async def produce(self, topic: str, partition: int, records: Sequence[ProduceRecord]) -> int:
+        """Send records to a partition and return the offset of the first one."""
+        body = ProduceRequest(topic, partition, tuple(records)).encode()
+        response = ProduceResponse.decode((await self.request(RequestType.PRODUCE, body)).body)
+        _check(RequestType.PRODUCE, response.error)
+        return response.base_offset
+
+    async def fetch(
+        self, topic: str, partition: int, offset: int, max_bytes: int = MAX_FETCH_RECORDS_SIZE
+    ) -> tuple[list[Record], int]:
+        """Read records from `offset`. Return them and the partition's next offset."""
+        body = FetchRequest(topic, partition, offset, max_bytes).encode()
+        response = FetchResponse.decode((await self.request(RequestType.FETCH, body)).body)
+        _check(RequestType.FETCH, response.error)
+        return list(response.records), response.high_watermark
+
+    async def metadata(self) -> dict[str, int]:
+        """Return every topic with its number of partitions."""
+        frame = await self.request(RequestType.METADATA, MetadataRequest().encode())
+        response = MetadataResponse.decode(frame.body)
+        _check(RequestType.METADATA, response.error)
+        return {topic.name: topic.partitions for topic in response.topics}
 
     async def _read_responses(self, reader: asyncio.StreamReader) -> None:
         error: Exception = ConnectionError("connection closed")

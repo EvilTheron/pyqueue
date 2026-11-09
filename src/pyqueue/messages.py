@@ -65,6 +65,7 @@ class ErrorCode(IntEnum):
     OFFSET_OUT_OF_RANGE = 4
     RECORD_TOO_LARGE = 5
     STORAGE_ERROR = 6
+    UNSUPPORTED_REQUEST = 7
 
 
 class BodyError(Exception):

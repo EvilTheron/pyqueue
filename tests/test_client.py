@@ -58,22 +58,22 @@ async def send_oversized_length(reader: asyncio.StreamReader, writer: asyncio.St
     writer.close()
 
 
-async def test_request_returns_response(server: Server) -> None:
-    async with Client(port=server.port) as client:
+async def test_request_returns_response(echo_server: Server) -> None:
+    async with Client(port=echo_server.port) as client:
         response = await client.request(RequestType.PRODUCE, b"hi")
     assert response.request_type is RequestType.PRODUCE
     assert response.body == b"hi"
 
 
-async def test_correlation_ids_increase(server: Server) -> None:
-    async with Client(port=server.port) as client:
+async def test_correlation_ids_increase(echo_server: Server) -> None:
+    async with Client(port=echo_server.port) as client:
         first = await client.request(RequestType.METADATA)
         second = await client.request(RequestType.METADATA)
     assert (first.correlation_id, second.correlation_id) == (0, 1)
 
 
-async def test_concurrent_requests_get_their_own_responses(server: Server) -> None:
-    async with Client(port=server.port) as client:
+async def test_concurrent_requests_get_their_own_responses(echo_server: Server) -> None:
+    async with Client(port=echo_server.port) as client:
         bodies = [f"msg-{i}".encode() for i in range(50)]
         responses = await asyncio.gather(
             *(client.request(RequestType.PRODUCE, body) for body in bodies)
@@ -87,8 +87,8 @@ async def test_request_before_connect_raises() -> None:
         await client.request(RequestType.METADATA)
 
 
-async def test_request_after_close_raises(server: Server) -> None:
-    async with Client(port=server.port) as client:
+async def test_request_after_close_raises(echo_server: Server) -> None:
+    async with Client(port=echo_server.port) as client:
         await client.request(RequestType.METADATA)
     with pytest.raises(RuntimeError):
         await client.request(RequestType.METADATA)
